@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
 
+# find_package will respect <Package>_ROOT variables
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.12.0)
+  cmake_policy(SET CMP0074 NEW)
+endif()
+
+# Files in CMAKE_MODULE_PATH are preferred over builtin modules
+cmake_policy(SET CMP0017 OLD)
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/modules")
 
 #install libraries into correct locations on all platforms
@@ -35,20 +43,40 @@ if (NOT CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE STREQUAL "")
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "" FORCE)
 endif()
 
-if (NOT CUDA_SOURCE_DIR)
-    set(CUDA_SOURCE_DIR "$ENV{CUDA_SOURCE_DIR}")
-    message(INFO " CUDA_SOURCE_DIR = ${CUDA_SOURCE_DIR}")
-endif()
-
 if (NOT ROCM_SOURCE_DIR)
-    set(ROCM_SOURCE_DIR "$ENV{ROCM_SOURCE_DIR}")
+    if (NOT ENV{ROCM_SOURCE_DIR})
+        set(ROCM_SOURCE_DIR "/opt/rocm")
+    else()
+        set(ROCM_SOURCE_DIR "$ENV{ROCM_SOURCE_DIR}")
+    endif()
     message(INFO " ROCM_SOURCE_DIR = ${ROCM_SOURCE_DIR}")
 endif()
 
+find_package(CUDAToolkit QUIET)
+
 # Set LIBKINETO_NOCUPTI to explicitly disable CUPTI
 # Otherwise, CUPTI is disabled if not found
-IF (NOT CUDA_SOURCE_DIR OR NOT CUPTI_INCLUDE_DIR OR NOT CUDA_cupti_LIBRARY)
-    set(LIBKINETO_NOCUPTI ON CACHE BOOL "" FORCE)
+include(CMakeDependentOption)
+cmake_dependent_option(
+    LIBKINETO_NOCUPTI "Build without cupti-support" OFF
+    "NOT CUDAToolkit_FOUND" ON)
+option(LIBKINETO_DYNAMIC_CUPTI "Link cupti dynamically")
+
+set(LIBKINETO_CUPTI_LIBRARIES "")
+if(NOT LIBKINETO_NOCUPTI)
+  if(LIBKINETO_DYNAMIC_CUPTI)
+    if (TARGET CUDA::cupti)
+      set(LIBKINETO_CUPTI_LIBRARIES CUDA::cudatoolkit CUDA::cupti)
+    else()
+      set(LIBKINETO_NOCUPTI ON)
+    endif()
+  else()
+    if (TARGET CUDA::cupti_static)
+      set(LIBKINETO_CUPTI_LIBRARIES CUDA::cudatoolkit CUDA::cupti_static)
+    else()
+      set(LIBKINETO_NOCUPTI ON)
+    endif()
+  endif()
 endif()
 
 IF (NOT ROCM_SOURCE_DIR AND NOT ROCTRACER_INCLUDE_DIR)
@@ -81,7 +109,6 @@ set_target_properties(kineto_base kineto_api PROPERTIES
       CXX_EXTENSIONS NO)
 
 set(KINETO_COMPILE_OPTIONS "-DKINETO_NAMESPACE=libkineto")
-list(APPEND KINETO_COMPILE_OPTIONS "-DFMT_HEADER_ONLY")
 if(NOT MSVC)
   list(APPEND KINETO_COMPILE_OPTIONS "-std=c++14")
 else()
@@ -119,15 +146,6 @@ if(NOT TARGET fmt)
   set(BUILD_SHARED_LIBS ${TEMP_BUILD_SHARED_LIBS} CACHE BOOL "Build shared libs" FORCE)
 endif()
 
-set(FMT_INCLUDE_DIR "${FMT_SOURCE_DIR}/include")
-message(STATUS "Kineto: FMT_SOURCE_DIR = ${FMT_SOURCE_DIR}")
-message(STATUS "Kineto: FMT_INCLUDE_DIR = ${FMT_INCLUDE_DIR}")
-if (NOT CUPTI_INCLUDE_DIR)
-    set(CUPTI_INCLUDE_DIR "${CUDA_SOURCE_DIR}/extras/CUPTI/include")
-endif()
-if (NOT CUDA_INCLUDE_DIRS)
-    set(CUDA_INCLUDE_DIRS "${CUDA_SOURCE_DIR}/include")
-endif()
 if (NOT ROCTRACER_INCLUDE_DIR)
     set(ROCTRACER_INCLUDE_DIR "${ROCM_SOURCE_DIR}/include/roctracer")
 endif()
@@ -141,15 +159,14 @@ message(INFO " ROCTRACER_INCLUDE_DIR = ${ROCTRACER_INCLUDE_DIR}")
 target_include_directories(kineto_base PUBLIC
       $<BUILD_INTERFACE:${LIBKINETO_INCLUDE_DIR}>
       $<BUILD_INTERFACE:${LIBKINETO_SOURCE_DIR}>
-      $<BUILD_INTERFACE:${FMT_INCLUDE_DIR}>
-      $<BUILD_INTERFACE:${CUPTI_INCLUDE_DIR}>
-      $<BUILD_INTERFACE:${CUDA_INCLUDE_DIRS}>
       $<BUILD_INTERFACE:${ROCTRACER_INCLUDE_DIR}>
       $<BUILD_INTERFACE:${ROCM_INCLUDE_DIRS}>)
+target_link_libraries(kineto_base PRIVATE
+      ${LIBKINETO_CUPTI_LIBRARIES}
+      fmt::fmt-header-only)
 
-target_include_directories(kineto_api PUBLIC
-      $<BUILD_INTERFACE:${FMT_INCLUDE_DIR}>
-      $<BUILD_INTERFACE:${LIBKINETO_INCLUDE_DIR}>)
+target_include_directories(kineto_api PRIVATE ${LIBKINETO_INCLUDE_DIR})
+target_link_libraries(kineto_api PRIVATE fmt::fmt-header-only)
 
 if(KINETO_LIBRARY_TYPE STREQUAL "default")
   add_library(kineto
@@ -171,16 +188,30 @@ endif()
 
 if(NOT LIBKINETO_NOROCTRACER)
   find_library(ROCTRACER_LIBRARY NAMES libroctracer64.so HINTS /opt/rocm/roctracer/lib)
-  target_link_libraries(kineto "${ROCTRACER_LIBRARY}")
+  target_link_libraries(kineto PUBLIC "${ROCTRACER_LIBRARY}")
   find_library(KINETO_HIP_LIBRARY NAMES libamdhip64.so HINTS /opt/rocm/lib)
-  target_link_libraries(kineto "${KINETO_HIP_LIBRARY}")
+  target_link_libraries(kineto PUBLIC "${KINETO_HIP_LIBRARY}")
 endif()
 
 if(NOT LIBKINETO_NOCUPTI)
-  target_link_libraries(kineto "${CUDA_cupti_LIBRARY}")
+  # Sanity check we can compile a simple program with cupti
+  include(CheckCXXSourceRuns)
+  set(CMAKE_REQUIRED_LIBRARIES "${CUPTI_TARGET}")
+  check_cxx_source_runs("#include <stdexcept>
+int main() {
+  try {
+    throw std::runtime_error(\"error\");
+  } catch (...) {
+    return 0;
+  }
+  return 1;
+}" EXCEPTIONS_WORK)
+  set(CMAKE_REQUIRED_LIBRARIES "")
+  if(NOT EXCEPTIONS_WORK)
+    message(FATAL_ERROR "Detected that linking against CUPTI causes exceptions to stop working.  See https://github.com/pytorch/pytorch/issues/57744 for more details.  Perhaps try: USE_CUPTI_SO=1 python setup.py develop --cmake")
+  endif()
 endif()
-target_link_libraries(kineto $<BUILD_INTERFACE:fmt::fmt-header-only>)
-add_dependencies(kineto fmt::fmt-header-only)
+target_link_libraries(kineto PUBLIC $<BUILD_INTERFACE:fmt::fmt-header-only>)
 
 install(TARGETS kineto EXPORT kinetoLibraryConfig
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
